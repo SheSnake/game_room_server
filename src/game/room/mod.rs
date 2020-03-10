@@ -58,6 +58,7 @@ impl GameRoomMng {
     }
 
     pub async fn get_room_topic(&self, room_id: &String) -> Option<String> {
+        None
     }
 
     pub fn create_room(&mut self, user_id: i64) -> (String, Code) {

@@ -9,6 +9,7 @@ use std::mem;
 use game::room::GameRoomMng;
 extern crate bincode;
 extern crate tokio;
+extern crate redis;
 use tokio::sync::mpsc::{ channel, Sender };
 use tokio::sync::{ Mutex };
 use tokio::runtime::Runtime;
@@ -25,6 +26,7 @@ use rdkafka::message::{Headers, Message};
 use rdkafka::topic_partition_list::TopicPartitionList;
 use rdkafka::util::get_rdkafka_version;
 use tokio::stream::StreamExt;
+use redis::AsyncCommands;
 
 
 struct CustomContext;
@@ -47,7 +49,7 @@ impl ConsumerContext for CustomContext {
 
 type LoggingConsumer = StreamConsumer<CustomContext>;
 
-async fn consume_and_print(brokers: &str, group_id: &str, topics: &[&str]) {
+async fn consume_and_print(brokers: &str, group_id: &str, topics: &[&str], mut sender: Sender<Vec<u8>>) {
     let context = CustomContext;
 
     let consumer: LoggingConsumer = ClientConfig::new()
@@ -77,12 +79,14 @@ async fn consume_and_print(brokers: &str, group_id: &str, topics: &[&str]) {
                 let payload: Vec<u8> = payload.iter().cloned().collect();
                 println!("key: '{:?}', payload: '{:?}', topic: {}, partition: {}, offset: {}, timestamp: {:?}",
                       m.key(), payload, m.topic(), m.partition(), m.offset(), m.timestamp());
-                if let Some(headers) = m.headers() {
-                    for i in 0..headers.count() {
-                        let header = headers.get(i).unwrap();
-                        println!("  Header {:#?}: {:?}", header.0, header.1);
+
+                match sender.send(payload).await {
+                    Ok(()) => {},
+                    Err(_) => {
+                        // TODO
                     }
                 }
+
                 consumer.commit_message(&m, CommitMode::Async).unwrap();
             }
         };
@@ -111,40 +115,42 @@ async fn main() {
     let redis_addr = "redis://127.0.0.1:6379/".to_string();
     let redis_uri = redis_addr.clone();
     let broker_port = "127.0.0.1:9092";
-    static topic: &[&str] = &["test", "test2"];
-    let group_id = "test-group";
-
-    let client_thread = thread::spawn(move || {
-        let listen_addr = "0.0.0.0:8890".to_string();
-        let writefd: Arc<Mutex<HashMap<i64, WriteHalf<TcpStream>>>> = Arc::new(Mutex::new(HashMap::new()));
-        let writefd_copy = writefd.clone();
-        let mut rt =  Runtime::new().unwrap();
-        
-        rt.spawn(async move {
-            const AUTHORIZED_INFO_SIZE: usize = 8;
-            loop {
-                let msg = rsp_rx.recv().await.unwrap();
-                let buf: &[u8] = &msg;
-                let mut authorized_buf = [0u8; AUTHORIZED_INFO_SIZE];
-                for i in 0..AUTHORIZED_INFO_SIZE {
-                    authorized_buf[i] = buf[i];
-                }
-                let authorized_user_id : i64 = i64::from_le_bytes(authorized_buf);
-                {
-                    let mut map = writefd_copy.lock().await;
-                    if let Some(fd) = map.get_mut(&authorized_user_id) {
-                        match fd.write(&buf[AUTHORIZED_INFO_SIZE..]).await {
-                            Ok(_) => {},
-                            Err(_) => {},
+    static num: &u8 = &1;
+    let topic_list_key = "topiclist:";
+    static topic: &str = "majiang_room_1_r1p1";
+    let client = redis::Client::open(redis_uri.clone()).unwrap();
+    let mut conn = client.get_async_connection().await.unwrap();
+    let ss: i64 = match conn.zrank(topic_list_key, topic).await {
+        Ok(v) => {
+            match v {
+                None => {
+                    println!("no this topic:{}, create it", topic);
+                    match conn.zadd(topic_list_key, topic, -1).await {
+                        Ok(v) => {
+                            v
+                        },
+                        Err(err) => {
+                            println!("redis get err: {}", err);
+                            0
                         }
                     }
+                },
+                Some(v) => {
+                    println!("get topic:{:?}, has room: {}", topic, v);
+                    v
                 }
             }
-        });
-        rt.spawn(consume_and_print(&broker_port, &group_id, topic));
-        rt.block_on(server_net::server_run(listen_addr, redis_uri, req_tx, writefd.clone()));
-    });
-    
+        }
+        Err(err) => {
+            println!("redis get err: {}", err);
+            0
+        }
+    };
+
+    static topics: &[&str] = &[topic];
+    let group_id = "majiang_room_group:1:";
+
+
     tokio::spawn(async move {
         let mut room_mng = GameRoomMng::new(3, redis_addr);
         let header_size = mem::size_of::<Header>();
@@ -284,5 +290,5 @@ async fn main() {
         }
     });
 
-    client_thread.join().unwrap();
+    consume_and_print(&broker_port, &group_id, topics, req_tx).await;
 }
