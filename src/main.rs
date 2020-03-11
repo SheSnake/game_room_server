@@ -1,97 +1,19 @@
-
-pub mod game;
-pub mod server_net;
-use std::collections::HashMap;
-use std::thread;
-//use std::sync::mpsc::channel;
-use server_net::message::*;
-use std::mem;
-use game::room::GameRoomMng;
 extern crate bincode;
 extern crate tokio;
 extern crate redis;
+pub mod game;
+pub mod server_net;
+
+use server_net::message::*;
+use server_net::kafka_client::*;
+use std::mem;
+use game::room::GameRoomMng;
 use tokio::sync::mpsc::{ channel, Sender };
-use tokio::sync::{ Mutex };
-use tokio::runtime::Runtime;
-use std::sync::Arc;
-use tokio::io::{ WriteHalf, AsyncWriteExt };
-use tokio::net::{ TcpStream};
-
-use rdkafka::client::ClientContext;
-use rdkafka::config::{ClientConfig, RDKafkaLogLevel};
-use rdkafka::consumer::stream_consumer::StreamConsumer;
-use rdkafka::consumer::{CommitMode, Consumer, ConsumerContext, Rebalance};
-use rdkafka::error::KafkaResult;
-use rdkafka::message::{Headers, Message};
-use rdkafka::topic_partition_list::TopicPartitionList;
-use rdkafka::util::get_rdkafka_version;
-use tokio::stream::StreamExt;
 use redis::AsyncCommands;
-
-
-struct CustomContext;
-
-impl ClientContext for CustomContext {}
-
-impl ConsumerContext for CustomContext {
-    fn pre_rebalance(&self, rebalance: &Rebalance) {
-        println!("Pre rebalance {:?}", rebalance);
-    }
-
-    fn post_rebalance(&self, rebalance: &Rebalance) {
-        println!("Post rebalance {:?}", rebalance);
-    }
-
-    fn commit_callback(&self, result: KafkaResult<()>, _offsets: &TopicPartitionList) {
-        println!("Committing offsets: {:?}", result);
-    }
-}
-
-type LoggingConsumer = StreamConsumer<CustomContext>;
-
-async fn consume_and_print(brokers: &str, group_id: &str, topics: &[&str], mut sender: Sender<Vec<u8>>) {
-    let context = CustomContext;
-
-    let consumer: LoggingConsumer = ClientConfig::new()
-        .set("group.id", group_id)
-        .set("bootstrap.servers", brokers)
-        .set("enable.partition.eof", "false")
-        .set("session.timeout.ms", "6000")
-        .set("enable.auto.commit", "true")
-        //.set("statistics.interval.ms", "30000")
-        //.set("auto.offset.reset", "smallest")
-        .set_log_level(RDKafkaLogLevel::Debug)
-        .create_with_context(context)
-        .expect("Consumer creation failed");
-
-    consumer.subscribe(&topics.to_vec()).expect("Can't subscribe to specified topics");
-
-    // consumer.start() returns a stream. The stream can be used ot chain together expensive steps,
-    // such as complex computations on a thread pool or asynchronous IO.
-    println!("try start");
-    let mut message_stream = consumer.start();
-
-    while let Some(message) = message_stream.next().await {
-        match message {
-            Err(e) => println!("Kafka error: {}", e),
-            Ok(m) => {
-                let payload = m.payload().unwrap();
-                let payload: Vec<u8> = payload.iter().cloned().collect();
-                println!("key: '{:?}', payload: '{:?}', topic: {}, partition: {}, offset: {}, timestamp: {:?}",
-                      m.key(), payload, m.topic(), m.partition(), m.offset(), m.timestamp());
-
-                match sender.send(payload).await {
-                    Ok(()) => {},
-                    Err(_) => {
-                        // TODO
-                    }
-                }
-
-                consumer.commit_message(&m, CommitMode::Async).unwrap();
-            }
-        };
-    }
-}
+use futures::*;
+use chrono::prelude::*;
+use rdkafka::producer::{ FutureProducer };
+use rdkafka::config::{ ClientConfig };
 
 use game::*;
 
@@ -107,6 +29,16 @@ async fn send_data(sender: &mut Sender<Vec<u8>>, user_id: &i64, data: Vec<u8>) {
     }
 }
 
+fn parse_authorized_user_id(msg: &Vec<u8>) -> i64 {
+    let buf: &[u8] = &msg;
+    let mut authorized_buf = [0u8; AUTHORIZED_INFO_SIZE];
+    for i in 0..AUTHORIZED_INFO_SIZE {
+        authorized_buf[i] = buf[i];
+    }
+    let authorized_user_id : i64 = i64::from_le_bytes(authorized_buf);
+    return authorized_user_id;
+}
+
 #[tokio::main]
 async fn main() {
     let (req_tx, mut req_rx)= channel::<Vec<u8>>(4096);
@@ -114,55 +46,60 @@ async fn main() {
     let req_tx_copy = req_tx.clone();
     let redis_addr = "redis://127.0.0.1:6379/".to_string();
     let redis_uri = redis_addr.clone();
-    let broker_port = "127.0.0.1:9092";
-    static num: &u8 = &1;
+    let broker_addr = "127.0.0.1:9092".to_string();
+    let worker_id: i64 = 1;
+    let max_open_room = 5;
+    let topic = format!("majiang_room_{}_r1p1", worker_id);
+    let rsp_topic = format!("majiang_room_{}_r1p1_rsp", worker_id);
+    let group_id = format!("majiang_room_group:{}:", worker_id);
     let topic_list_key = "topiclist:";
-    static topic: &str = "majiang_room_1_r1p1";
-    let client = redis::Client::open(redis_uri.clone()).unwrap();
-    let mut conn = client.get_async_connection().await.unwrap();
-    let ss: i64 = match conn.zrank(topic_list_key, topic).await {
+    let redis_client = redis::Client::open(redis_uri.clone()).unwrap();
+    let mut conn = redis_client.get_async_connection().await.unwrap();
+    match conn.zrank(topic_list_key.clone(), topic.clone()).await {
         Ok(v) => {
-            match v {
-                None => {
+            match redis::from_redis_value::<i64>(&v) {
+                Ok(rank) => {},
+                Err(_) => {
                     println!("no this topic:{}, create it", topic);
-                    match conn.zadd(topic_list_key, topic, -1).await {
+                    let _: i64 = match conn.zadd(topic_list_key.clone(), topic.clone(), -1).await {
                         Ok(v) => {
                             v
                         },
                         Err(err) => {
-                            println!("redis get err: {}", err);
+                            println!("redis add worker_id:{}, topic:{} fail err: {}", worker_id, topic, err);
                             0
                         }
-                    }
-                },
-                Some(v) => {
-                    println!("get topic:{:?}, has room: {}", topic, v);
-                    v
+                    };
                 }
             }
         }
         Err(err) => {
-            println!("redis get err: {}", err);
-            0
+            println!("redis query worker_id:{}, topic:{} fail err: {}", worker_id, topic, err);
+            return;
         }
     };
 
-    static topics: &[&str] = &[topic];
-    let group_id = "majiang_room_group:1:";
-
-
+    let broker_addr_copy = broker_addr.clone();
     tokio::spawn(async move {
-        let mut room_mng = GameRoomMng::new(3, redis_addr);
-        let header_size = mem::size_of::<Header>();
+        let producer: FutureProducer = ClientConfig::new()
+            .set("bootstrap.servers", &broker_addr_copy)
+            .set("message.timeout.ms", "5000")
+            .create()
+            .expect("Producer creation error");
+        loop {
+            let msg = rsp_rx.recv().await.unwrap();
+            produce(&producer, &rsp_topic, &msg).await;
+        }
+    });
+
+    let topic_copy = topic.clone();
+    tokio::spawn(async move {
+        let mut room_mng = GameRoomMng::new(max_open_room, redis_addr, topic_copy);
         loop {
             let msg = req_rx.recv().await.unwrap();
+            let authorized_user_id = parse_authorized_user_id(&msg);
             let buf: &[u8] = &msg;
-            let mut authorized_buf = [0u8; AUTHORIZED_INFO_SIZE];
-            for i in 0..AUTHORIZED_INFO_SIZE {
-                authorized_buf[i] = buf[i];
-            }
-            let authorized_user_id : i64 = i64::from_le_bytes(authorized_buf);
-            let header = bincode::deserialize::<Header> (&buf[AUTHORIZED_INFO_SIZE..AUTHORIZED_INFO_SIZE + header_size]).unwrap();
+            let header = bincode::deserialize::<Header> (&buf[AUTHORIZED_INFO_SIZE..AUTHORIZED_INFO_SIZE + HEADER_SIZE]).unwrap();
             println!("recv msg_type:{} from user:{}", header.msg_type, authorized_user_id);
             match unsafe { mem::transmute(header.msg_type) } {
                 MsgType::GameOp => {
@@ -195,19 +132,19 @@ async fn main() {
                     let mut room_id = String::from_utf8(room_id).unwrap();
                     match unsafe { mem::transmute(op.op_type) } {
                         OpType::CreateRoom => {
-                            let (created_room_id, code) = room_mng.create_room(op.user_id);
+                            let (created_room_id, code) = room_mng.create_room(op.user_id).await;
                             msg.room_id = created_room_id.clone().into_bytes();
                             msg.code = unsafe { mem::transmute(code) };
                             room_id = created_room_id;
                             unsafe { println!("user:{} create room:{}", op.user_id.clone(), room_id) };
                         },
                         OpType::JoinRoom => {
-                            let (err, code) = room_mng.join_room(op.user_id, &room_id);
+                            let (err, code) = room_mng.join_room(op.user_id, &room_id).await;
                             msg.room_id = err.into_bytes();
                             msg.code = unsafe { mem::transmute(code) };
                         },
                         OpType::LeaveRoom => {
-                            let (err, code) = room_mng.leave_room(op.user_id, &room_id);
+                            let (err, code) = room_mng.leave_room(op.user_id, &room_id).await;
                             msg.room_id = err.into_bytes();
                             msg.code = unsafe { mem::transmute(code) };
                         },
@@ -233,6 +170,9 @@ async fn main() {
                         let snapshot = room_mng.get_room_snapshot(&room_id).unwrap();
                         let data: Vec<u8> = bincode::serialize::<RoomSnapshot>(&snapshot).unwrap();
                         for user_id in room_users.iter() {
+                            if *user_id == -1 {
+                                continue;
+                            }
                             send_data(&mut rsp_tx, &user_id, data.clone()).await;
                         }
                         if let Some(all_ready) = room_mng.all_ready(&room_id) {
@@ -246,7 +186,7 @@ async fn main() {
                                 update.header.len = update.size() as i32;
                                 let data: Vec<u8> = bincode::serialize::<RoomUpdate>(&update).unwrap();
                                 for user_id in room_users.iter() {
-                                    send_data(&mut rsp_tx, user_id, data.clone()).await;
+                                    send_data(&mut rsp_tx, &user_id, data.clone()).await;
                                 }
                                 let (game_msg_tx, game_msg_rx) = channel::<Vec<u8>>(4096);
                                 room_mng.set_room_notifier(&room_id, game_msg_tx);
@@ -262,7 +202,7 @@ async fn main() {
                     if let Some(room_users) = room_mng.get_room_user_id(&room_id) {
                         let snapshot = room_mng.get_room_snapshot(&room_id).unwrap();
                         let data: Vec<u8> = bincode::serialize::<RoomSnapshot>(&snapshot).unwrap();
-                        println!("room:{} over", room_id);
+                        println!("room:{} over, broadcast room snapshot", room_id);
                         for user_id in room_users.iter() {
                             send_data(&mut rsp_tx, &user_id, data.clone()).await;
                         }
@@ -290,5 +230,6 @@ async fn main() {
         }
     });
 
-    consume_and_print(&broker_port, &group_id, topics, req_tx).await;
+    let topics = [topic.as_str()];
+    consume(&broker_addr, &group_id, &topics, req_tx).await;
 }

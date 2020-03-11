@@ -13,6 +13,7 @@ use std::sync::Arc;
 use std::mem;
 use std::collections::HashMap;
 use super::server_net::message::*;
+use chrono::prelude::*;
 
 use player::Player;
 
@@ -566,7 +567,7 @@ pub struct StartGame {
 impl StartGame {
     pub fn new(room_id: String, players: Vec<i64>, notifier: Sender<Vec<u8>>, receiver: Receiver<Vec<u8>>, main_sender: Sender<Vec<u8>>) -> StartGame {
         let mut player_state = Vec::new();
-        let start_score = 10;
+        let start_score = 40;
         for (ix, &user_id) in players.iter().enumerate() {
             player_state.push({ Player {
                 id: user_id,

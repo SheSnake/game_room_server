@@ -22,6 +22,7 @@ pub struct GameRoom {
 }
 
 pub struct GameRoomMng {
+    topic_name: String,
     redis_uri: String,
     room_topic: HashMap<String, String>,
     letters: Vec<char>,
@@ -33,8 +34,9 @@ pub struct GameRoomMng {
 }
 
 impl GameRoomMng {
-    pub fn new(max_room_num: usize, redis_uri: String) -> GameRoomMng {
+    pub fn new(max_room_num: usize, redis_uri: String, topic_name: String) -> GameRoomMng {
         return GameRoomMng {
+            topic_name: topic_name,
             redis_uri: redis_uri.clone(),
             redis_client: redis::Client::open(redis_uri.clone()).unwrap(),
             room_topic: HashMap::new(),
@@ -57,11 +59,7 @@ impl GameRoomMng {
         return room_id;
     }
 
-    pub async fn get_room_topic(&self, room_id: &String) -> Option<String> {
-        None
-    }
-
-    pub fn create_room(&mut self, user_id: i64) -> (String, Code) {
+    pub async fn create_room(&mut self, user_id: i64) -> (String, Code) {
         let err = "".to_string();
         if self.user_rooms.contains_key(&user_id) {
             let room_id = self.user_rooms.get(&user_id).unwrap().clone();
@@ -74,6 +72,35 @@ impl GameRoomMng {
         while self.act_rooms.contains_key(&room_id) {
             room_id = self.random_room_id();
         }
+
+        let mut conn = self.redis_client.get_async_connection().await.unwrap();
+        let key = format!("topic_name:{}:", room_id);
+        match conn.set(key.clone(), self.topic_name.clone()).await {
+            Err(err) => {
+                println!("redis set: {} fail, {}", key, err);
+                return (err.to_string(), Code::CreateFail);
+            },
+            Ok(v) => {
+                match v {
+                    redis::Value::Nil => {},
+                    _ => {},
+                }
+            },
+        };
+        let key = format!("room_id:{}:", user_id);
+        match conn.set(key.clone(), room_id.clone()).await {
+            Err(err) => {
+                println!("redis set:{} err: {}", key, err);
+                return (err.to_string(), Code::CreateFail);
+            },
+            Ok(v) => {
+                match v {
+                    redis::Value::Nil => {},
+                    _ => {},
+                }
+            },
+        };
+
         let room = GameRoom {
             room_id: room_id.clone(),
             room_type: 1,
@@ -87,7 +114,7 @@ impl GameRoomMng {
         return (room_id, Code::CreateOk);
     }
 
-    pub fn join_room(&mut self, user_id: i64, room_id: &String) -> (String, Code) {
+    pub async fn join_room(&mut self, user_id: i64, room_id: &String) -> (String, Code) {
         let err = "".to_string();
         if self.user_rooms.contains_key(&user_id) {
             return (err, Code::AlreadyInRoom);
@@ -103,10 +130,24 @@ impl GameRoomMng {
             if pos == 999 {
                 return (err, Code::RoomFull);
             }
+            let mut conn = self.redis_client.get_async_connection().await.unwrap();
+            let key = format!("room_id:{}:", user_id);
+            match conn.set(key, room_id.clone()).await {
+                Ok(v) => {
+                    match v {
+                        redis::Value::Nil => {},
+                        _ => {},
+                    }
+                },
+                Err(err) => {
+                    return (err.to_string(), Code::RoomInexist);
+                }
+            };
             room.players[pos] = user_id;
             self.user_rooms.insert(user_id, room_id.clone());
             return (room_id.clone(), Code::JoinOk);
         }
+
         return (err, Code::RoomInexist);
     }
 
@@ -149,12 +190,25 @@ impl GameRoomMng {
         return None;
     }
 
-    pub fn leave_room(&mut self, user_id: i64, room_id: &String) -> (String, Code) {
+    pub async fn leave_room(&mut self, user_id: i64, room_id: &String) -> (String, Code) {
         let err = "".to_string();
         if let Some(in_room) = self.user_rooms.get(&user_id) {
             if *in_room != *room_id {
                 return (err, Code::WrongRoom);
             }
+            let mut conn = self.redis_client.get_async_connection().await.unwrap();
+            let key = format!("room_id:{}:", user_id);
+            match conn.del(key).await {
+                Ok(v) => {
+                    match v {
+                        redis::Value::Nil => {},
+                        _ => {},
+                    }
+                },
+                Err(err) => {
+                    return (err.to_string(), Code::RoomInexist);
+                }
+            };
             if let Some(room) = self.act_rooms.get_mut(room_id) {
                 room.readys.remove(&user_id);
                 for i in 0..room.players.len() {
